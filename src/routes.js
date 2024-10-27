@@ -1,110 +1,208 @@
-// src/routes.js
 const express = require('express');
-const db = require('../database');
+const { Transaction } = require('./database'); // Import the Transaction model
 const router = express.Router();
 
+
+router.use((req, res, next) => {
+  const token = req.headers['authorization'];
+  if (token === `Bearer ${AUTH_TOKEN}`) {
+    next();
+  } else {
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+})
 function getMonthNumber(month) {
   return new Date(`${month} 1, 2000`).getMonth() + 1;
 }
 
+// Hello World route
+router.get('/', (req, res) => {
+  res.json({ message: 'Hello World' });
+});
+
 // List transactions with pagination and search
-router.get('/transactions', (req, res) => {
-  const { page = 1, perPage = 10, search = '', month } = req.query;
-  const monthNumber = getMonthNumber(month);
-  const offset = (page - 1) * perPage;
+router.get('/transactions', async (req, res) => {
+  try {
+    const { page = 1, perPage = 10, search = '', month } = req.query;
+    const monthNumber = getMonthNumber(month);
 
-  let query = `SELECT * FROM transactions WHERE strftime('%m', dateOfSale) = ?`;
-  const params = [String(monthNumber).padStart(2, '0')];
+    const filter = {
+      dateOfSale: { $regex: `-${String(monthNumber).padStart(2, '0')}-` },
+      ...(search && {
+        $or: [
+          { title: { $regex: search, $options: 'i' } },
+          { description: { $regex: search, $options: 'i' } },
+          { price: { $regex: search, $options: 'i' } }
+        ]
+      })
+    };
 
-  if (search) {
-    query += ` AND (title LIKE ? OR description LIKE ? OR price LIKE ?)`;
-    params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+    const transactions = await Transaction.find(filter)
+      .skip((page - 1) * perPage)
+      .limit(Number(perPage));
+
+    res.json(transactions);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
-
-  query += ` LIMIT ? OFFSET ?`;
-  params.push(parseInt(perPage), parseInt(offset));
-
-  db.all(query, params, (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json(rows);
-  });
 });
 
 // Statistics API
-router.get('/statistics', (req, res) => {
-  const monthNumber = getMonthNumber(req.query.month);
+router.get('/statistics', async (req, res) => {
+  try {
+    const monthNumber = getMonthNumber(req.query.month);
 
-  db.get(
-    `SELECT
-      SUM(price) AS totalSale,
-      COUNT(CASE WHEN sold = 1 THEN 1 END) AS soldItems,
-      COUNT(CASE WHEN sold = 0 THEN 1 END) AS unsoldItems
-    FROM transactions
-    WHERE strftime('%m', dateOfSale) = ?`,
-    [String(monthNumber).padStart(2, '0')],
-    (err, row) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
+    const stats = await Transaction.aggregate([
+      { $match: { dateOfSale: { $regex: `-${String(monthNumber).padStart(2, '0')}-` } } },
+      {
+        $group: {
+          _id: null,
+          totalSale: { $sum: '$price' },
+          soldItems: { $sum: { $cond: [{ $eq: ['$sold', true] }, 1, 0] } },
+          unsoldItems: { $sum: { $cond: [{ $eq: ['$sold', false] }, 1, 0] } }
+        }
       }
-      res.json(row);
-    }
-  );
+    ]);
+
+    res.json(stats[0] || { totalSale: 0, soldItems: 0, unsoldItems: 0 });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Bar chart API
-router.get('/bar-chart', (req, res) => {
-  const monthNumber = getMonthNumber(req.query.month);
-  const ranges = [
-    [0, 100], [101, 200], [201, 300], [301, 400], [401, 500],
-    [501, 600], [601, 700], [701, 800], [801, 900], [901, Infinity]
-  ];
+router.get('/bar-chart', async (req, res) => {
+  try {
+    const monthNumber = getMonthNumber(req.query.month);
+    const ranges = [
+      { min: 0, max: 100 },
+      { min: 101, max: 200 },
+      { min: 201, max: 300 },
+      { min: 301, max: 400 },
+      { min: 401, max: 500 },
+      { min: 501, max: 600 },
+      { min: 601, max: 700 },
+      { min: 701, max: 800 },
+      { min: 801, max: 900 },
+      { min: 901, max: Infinity }
+    ];
 
-  const promises = ranges.map(([min, max]) => new Promise((resolve) => {
-    db.get(
-      `SELECT COUNT(*) AS count FROM transactions WHERE price BETWEEN ? AND ? AND strftime('%m', dateOfSale) = ?`,
-      [min, max === Infinity ? 999999 : max, String(monthNumber).padStart(2, '0')],
-      (err, row) => {
-        resolve({ range: `${min}-${max}`, count: row.count });
-      }
+    const results = await Promise.all(
+      ranges.map(async ({ min, max }) => {
+        const count = await Transaction.countDocuments({
+          dateOfSale: { $regex: `-${String(monthNumber).padStart(2, '0')}-` },
+          price: { $gte: min, ...(max !== Infinity ? { $lte: max } : {}) }
+        });
+        return { range: `${min}-${max}`, count };
+      })
     );
-  }));
 
-  Promise.all(promises).then((data) => res.json(data));
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Pie chart API
-router.get('/pie-chart', (req, res) => {
-  const monthNumber = getMonthNumber(req.query.month);
+router.get('/pie-chart', async (req, res) => {
+  try {
+    const monthNumber = getMonthNumber(req.query.month);
 
-  db.all(
-    `SELECT category, COUNT(*) AS count FROM transactions WHERE strftime('%m', dateOfSale) = ? GROUP BY category`,
-    [String(monthNumber).padStart(2, '0')],
-    (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
+    const pieData = await Transaction.aggregate([
+      {
+        $match: { dateOfSale: { $regex: `-${String(monthNumber).padStart(2, '0')}-` } }
+      },
+      {
+        $group: { _id: '$category', count: { $sum: 1 } }
+      },
+      {
+        $project: { category: '$_id', count: 1, _id: 0 }
       }
-      res.json(rows);
-    }
-  );
+    ]);
+
+    res.json(pieData);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Combined data API
 router.get('/combined-data', async (req, res) => {
   try {
-    const [transactions, statistics, barChart, pieChart] = await Promise.all([
-      axios.get(`http://localhost:5000/api/transactions`, { params: req.query }),
-      axios.get(`http://localhost:5000/api/statistics`, { params: req.query }),
-      axios.get(`http://localhost:5000/api/bar-chart`, { params: req.query }),
-      axios.get(`http://localhost:5000/api/pie-chart`, { params: req.query }),
+    const { page = 1, perPage = 10, search = '', month } = req.query;
+    const monthNumber = getMonthNumber(month);
+
+    const filter = {
+      dateOfSale: { $regex: `-${String(monthNumber).padStart(2, '0')}-` },
+      ...(search && {
+        $or: [
+          { title: { $regex: search, $options: 'i' } },
+          { description: { $regex: search, $options: 'i' } },
+          { price: { $regex: search, $options: 'i' } }
+        ]
+      })
+    };
+
+    // Transactions
+    const transactions = await Transaction.find(filter)
+      .skip((page - 1) * perPage)
+      .limit(Number(perPage));
+
+    // Statistics
+    const stats = await Transaction.aggregate([
+      { $match: { dateOfSale: { $regex: `-${String(monthNumber).padStart(2, '0')}-` } } },
+      {
+        $group: {
+          _id: null,
+          totalSale: { $sum: '$price' },
+          soldItems: { $sum: { $cond: [{ $eq: ['$sold', true] }, 1, 0] } },
+          unsoldItems: { $sum: { $cond: [{ $eq: ['$sold', false] }, 1, 0] } }
+        }
+      }
+    ]);
+
+    // Bar chart data
+    const ranges = [
+      { min: 0, max: 100 },
+      { min: 101, max: 200 },
+      { min: 201, max: 300 },
+      { min: 301, max: 400 },
+      { min: 401, max: 500 },
+      { min: 501, max: 600 },
+      { min: 601, max: 700 },
+      { min: 701, max: 800 },
+      { min: 801, max: 900 },
+      { min: 901, max: Infinity }
+    ];
+
+    const barChart = await Promise.all(
+      ranges.map(async ({ min, max }) => {
+        const count = await Transaction.countDocuments({
+          dateOfSale: { $regex: `-${String(monthNumber).padStart(2, '0')}-` },
+          price: { $gte: min, ...(max !== Infinity ? { $lte: max } : {}) }
+        });
+        return { range: `${min}-${max}`, count };
+      })
+    );
+
+    // Pie chart data
+    const pieChart = await Transaction.aggregate([
+      {
+        $match: { dateOfSale: { $regex: `-${String(monthNumber).padStart(2, '0')}-` } }
+      },
+      {
+        $group: { _id: '$category', count: { $sum: 1 } }
+      },
+      {
+        $project: { category: '$_id', count: 1, _id: 0 }
+      }
     ]);
 
     res.json({
-      transactions: transactions.data,
-      statistics: statistics.data,
-      barChart: barChart.data,
-      pieChart: pieChart.data
+      transactions,
+      statistics: stats[0] || { totalSale: 0, soldItems: 0, unsoldItems: 0 },
+      barChart,
+      pieChart
     });
   } catch (error) {
     res.status(500).json({ error: 'Error combining data' });
